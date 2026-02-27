@@ -1,0 +1,20 @@
+# Requirements for MinerU Web Interface
+
+# Web Framework
+flask>=2.0.0
+werkzeug>=2.0.0
+
+# MinerU - PDF to Markdown conversion (standalone, no GitHub dependency needed)
+# Install with: pip install mineru
+# This package is available on PyPI and provides all PDF processing functionality
+
+# Optional: Production server
+# gunicorn>=20.0.0
+
+# Optional: For better performance in production
+# flask-compress>=1.13
+
+# Note: For production deployment, consider:
+# 1. Setting SECRET_KEY environment variable
+# 2. Using a proper WSGI server like gunicorn
+# 3. Adding rate limiting middleware
