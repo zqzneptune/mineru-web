@@ -40,11 +40,12 @@ os.makedirs(OUTPUTS_FOLDER, exist_ok=True)
 from database import (
     init_db, add_document, get_document, get_all_documents, 
     update_document_status, delete_document, get_document_files,
-    get_folder_tree, get_file_content
+    get_folder_tree, get_file_content, get_safe_path, SecurityError, get_document_log
 )
 from tasks import (
     register_listener, unregister_listener, send_log, start_processing_thread,
-    create_log_queue, get_log_queue, remove_log_queue, get_task_status
+    create_log_queue, get_log_queue, remove_log_queue, get_task_status,
+    get_queue_position
 )
 
 
@@ -170,6 +171,15 @@ def delete_doc(doc_id):
     return jsonify({'error': 'Document not found'}), 404
 
 
+@app.route('/documents/<int:doc_id>/logs', methods=['GET'])
+def get_doc_logs(doc_id):
+    """Get historical logs for a document"""
+    result = get_document_log(doc_id)
+    if 'error' in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
 @app.route('/documents/<int:doc_id>/download/<path:filename>', methods=['GET'])
 def download_file(doc_id, filename):
     """Download a processed file"""
@@ -177,11 +187,17 @@ def download_file(doc_id, filename):
     if not doc:
         return jsonify({'error': 'Document not found'}), 404
     
-    file_path = os.path.join(doc['output_path'], filename)
-    if not os.path.exists(file_path):
+    # Use safe path validation
+    try:
+        file_path = os.path.join(doc['output_path'], filename)
+        safe_path = get_safe_path(file_path)
+    except SecurityError as e:
+        return jsonify({'error': str(e)}), 403
+    
+    if not os.path.exists(safe_path):
         return jsonify({'error': 'File not found'}), 404
     
-    return send_file(file_path, as_attachment=True)
+    return send_file(safe_path, as_attachment=True)
 
 
 @app.route('/logs/<int:doc_id>')
@@ -235,7 +251,8 @@ def stream_logs(doc_id):
 @app.route('/folder-tree', methods=['GET'])
 def get_tree():
     """Get folder tree structure"""
-    tree = get_folder_tree()
+    doc_id = request.args.get('doc_id', type=int)
+    tree = get_folder_tree(doc_id)
     return jsonify(tree)
 
 
@@ -291,10 +308,14 @@ def task_status(doc_id):
     if not doc:
         return jsonify({'error': 'Document not found'}), 404
     
+    task_id = f"task_{doc_id}"
+    queue_position = get_queue_position(task_id)
+    
     return jsonify({
         'doc_id': doc_id,
         'status': doc['status'],
-        'error_message': doc.get('error_message')
+        'error_message': doc.get('error_message'),
+        'queue_position': queue_position
     })
 
 
@@ -305,11 +326,17 @@ def download_single_file():
     if not file_path:
         return jsonify({'error': 'No file path provided'}), 400
     
-    if not os.path.exists(file_path):
+    # Use safe path validation
+    try:
+        safe_path = get_safe_path(file_path)
+    except SecurityError as e:
+        return jsonify({'error': str(e)}), 403
+    
+    if not os.path.exists(safe_path):
         return jsonify({'error': 'File not found'}), 404
     
-    filename = os.path.basename(file_path)
-    return send_file(file_path, as_attachment=True, download_name=filename)
+    filename = os.path.basename(safe_path)
+    return send_file(safe_path, as_attachment=True, download_name=filename)
 
 
 @app.route('/view-image', methods=['GET'])
@@ -319,11 +346,17 @@ def view_image():
     if not file_path:
         return jsonify({'error': 'No file path provided'}), 400
     
-    if not os.path.exists(file_path):
+    # Use safe path validation
+    try:
+        safe_path = get_safe_path(file_path)
+    except SecurityError as e:
+        return jsonify({'error': str(e)}), 403
+    
+    if not os.path.exists(safe_path):
         return jsonify({'error': 'File not found'}), 404
     
     # Determine content type
-    ext = os.path.splitext(file_path)[1].lower()
+    ext = os.path.splitext(safe_path)[1].lower()
     content_types = {
         '.jpg': 'image/jpeg',
         '.jpeg': 'image/jpeg',
@@ -334,7 +367,7 @@ def view_image():
     }
     content_type = content_types.get(ext, 'application/octet-stream')
     
-    return send_file(file_path, mimetype=content_type)
+    return send_file(safe_path, mimetype=content_type)
 
 
 @app.route('/view-pdf', methods=['GET'])
@@ -344,15 +377,21 @@ def view_pdf():
     if not file_path:
         return jsonify({'error': 'No file path provided'}), 400
     
-    if not os.path.exists(file_path):
+    # Use safe path validation
+    try:
+        safe_path = get_safe_path(file_path)
+    except SecurityError as e:
+        return jsonify({'error': str(e)}), 403
+    
+    if not os.path.exists(safe_path):
         return jsonify({'error': 'File not found'}), 404
     
     # Validate the file is actually a PDF
-    ext = os.path.splitext(file_path)[1].lower()
+    ext = os.path.splitext(safe_path)[1].lower()
     if ext != '.pdf':
         return jsonify({'error': 'Not a PDF file'}), 400
     
-    return send_file(file_path, mimetype='application/pdf')
+    return send_file(safe_path, mimetype='application/pdf')
 
 
 @app.route('/health', methods=['GET'])

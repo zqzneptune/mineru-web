@@ -8,6 +8,56 @@ from typing import Optional, Dict, List, Any
 
 DATABASE_PATH = os.path.join(os.path.dirname(__file__), 'mineru_web.db')
 
+# Base directories for path validation
+BASE_DIR = os.path.dirname(__file__)
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+OUTPUTS_FOLDER = os.path.join(BASE_DIR, 'outputs')
+
+
+class SecurityError(Exception):
+    """Exception raised when path validation fails"""
+    pass
+
+
+def get_safe_path(requested_path: str) -> str:
+    """
+    Validate and return a safe path that is within allowed directories.
+    
+    Args:
+        requested_path: The path requested by the user
+        
+    Returns:
+        The absolute safe path if valid
+        
+    Raises:
+        SecurityError: If the path is invalid or outside allowed directories
+    """
+    if not requested_path:
+        raise SecurityError('No file path provided')
+    
+    try:
+        # Resolve the absolute path
+        abs_path = os.path.abspath(requested_path)
+        
+        # Normalize allowed directories
+        upload_dir = os.path.abspath(UPLOAD_FOLDER)
+        output_dir = os.path.abspath(OUTPUTS_FOLDER)
+        
+        # Check if the path starts with either allowed directory
+        is_allowed = abs_path.startswith(upload_dir) or abs_path.startswith(output_dir)
+        
+        if not is_allowed:
+            raise SecurityError(
+                f'Access denied: Path must be within outputs or uploads directory. '
+                f'Allowed directories: {upload_dir}, {output_dir}'
+            )
+        
+        return abs_path
+        
+    except (ValueError, OSError) as e:
+        raise SecurityError(f'Invalid file path: {str(e)}')
+
+
 # Thread-local storage for database connections
 _local = threading.local()
 
@@ -247,13 +297,22 @@ def _is_cache_valid(cache_entry: tuple) -> bool:
     return (time.time() - timestamp) < _folder_tree_cache_ttl
 
 
-def get_folder_tree() -> List[dict]:
+def get_folder_tree(doc_id: Optional[int] = None) -> List[dict]:
     """
     Get folder tree structure for all completed documents.
     Returns a nested list of documents with their files.
     Uses caching for improved performance.
+    
+    Args:
+        doc_id: Optional document ID to get tree for a specific document only.
+                If provided, returns only children for that document (lazy loading).
     """
     import time
+    
+    # If doc_id is provided, return only that document's tree (lazy loading)
+    if doc_id is not None:
+        return _get_single_document_tree(doc_id)
+    
     cache_key = 'folder_tree'
     
     # Check cache first
@@ -263,74 +322,15 @@ def get_folder_tree() -> List[dict]:
             if _is_cache_valid((cached_time, cached_tree)):
                 return cached_tree
     
-    # Build tree
+    # Build tree for all documents
     documents = get_all_documents()
     tree = []
     
     for doc in documents:
         if doc['status'] != 'completed':
             continue
-            
-        doc_tree = {
-            'id': doc['id'],
-            'name': doc['original_filename'],
-            'type': 'folder',
-            'path': doc['output_path'],
-            'children': []
-        }
-        
-        # Get files for this document
-        if doc['output_path'] and os.path.exists(doc['output_path']):
-            output_path = Path(doc['output_path'])
-            
-            # Build nested structure
-            try:
-                for item in output_path.rglob('*'):
-                    if item.is_file():
-                        try:
-                            rel_path = item.relative_to(output_path)
-                            parts = rel_path.parts
-                            
-                            # Add to tree structure
-                            current_level = doc_tree['children']
-                            for part in parts[:-1]:
-                                # Find or create folder at this level
-                                found = None
-                                for child in current_level:
-                                    if child['name'] == part and child['type'] == 'folder':
-                                        found = child
-                                        break
-                                
-                                if found is None:
-                                    found = {
-                                        'name': part,
-                                        'type': 'folder',
-                                        'path': str(output_path / part),
-                                        'children': []
-                                    }
-                                    current_level.append(found)
-                                
-                                current_level = found['children']
-                            
-                            # Add file at the last level
-                            try:
-                                file_size = item.stat().st_size
-                                current_level.append({
-                                    'name': item.name,
-                                    'type': 'file',
-                                    'path': str(item),
-                                    'size': file_size,
-                                    'ext': item.suffix.lower()
-                                })
-                            except (OSError, PermissionError):
-                                continue
-                        except (OSError, ValueError):
-                            continue
-            except (OSError, PermissionError):
-                pass
-        
-        # Only add if there are files
-        if doc_tree['children'] or os.path.exists(doc['output_path']):
+        doc_tree = _build_doc_tree(doc)
+        if doc_tree:
             tree.append(doc_tree)
     
     # Cache the result
@@ -340,32 +340,93 @@ def get_folder_tree() -> List[dict]:
     return tree
 
 
+def _get_single_document_tree(doc_id: int) -> List[dict]:
+    """Get folder tree for a single document (lazy loading)"""
+    doc = get_document(doc_id)
+    if not doc or doc['status'] != 'completed':
+        return []
+    
+    doc_tree = _build_doc_tree(doc)
+    return [doc_tree] if doc_tree else []
+
+
+def _build_doc_tree(doc: dict) -> Optional[dict]:
+    """Build tree structure for a single document"""
+    doc_tree = {
+        'id': doc['id'],
+        'name': doc['original_filename'],
+        'type': 'folder',
+        'path': doc['output_path'],
+        'children': []
+    }
+    
+    # Get files for this document
+    if doc['output_path'] and os.path.exists(doc['output_path']):
+        output_path = Path(doc['output_path'])
+        
+        # Build nested structure
+        try:
+            for item in output_path.rglob('*'):
+                if item.is_file():
+                    try:
+                        rel_path = item.relative_to(output_path)
+                        parts = rel_path.parts
+                        
+                        # Add to tree structure
+                        current_level = doc_tree['children']
+                        for part in parts[:-1]:
+                            # Find or create folder at this level
+                            found = None
+                            for child in current_level:
+                                if child['name'] == part and child['type'] == 'folder':
+                                    found = child
+                                    break
+                            
+                            if found is None:
+                                found = {
+                                    'name': part,
+                                    'type': 'folder',
+                                    'path': str(output_path / part),
+                                    'children': []
+                                }
+                                current_level.append(found)
+                            
+                            current_level = found['children']
+                        
+                        # Add file at the last level
+                        try:
+                            file_size = item.stat().st_size
+                            current_level.append({
+                                'name': item.name,
+                                'type': 'file',
+                                'path': str(item),
+                                'size': file_size,
+                                'ext': item.suffix.lower()
+                            })
+                        except (OSError, PermissionError):
+                            continue
+                    except (OSError, ValueError):
+                        continue
+        except (OSError, PermissionError):
+            pass
+    
+    # Only add if there are files
+    if doc_tree['children'] or os.path.exists(doc['output_path']):
+        return doc_tree
+    
+    return None
+
+
 def get_file_content(file_path: str, max_size: int = 1024 * 1024) -> dict:
     """
     Get file content for preview with path validation.
     Returns metadata and content (truncated if too large).
     """
-    # Validate and sanitize the file path to prevent directory traversal
-    if not file_path:
-        return {'error': 'No file path provided'}
-    
-    # Resolve the path and check it's within allowed directories
+    # Use get_safe_path for validation
     try:
-        abs_path = os.path.abspath(file_path)
-        # Only allow files within outputs or uploads directories
-        base_dir = os.path.dirname(__file__)
-        allowed_dirs = [
-            os.path.join(base_dir, 'outputs'),
-            os.path.join(base_dir, 'uploads')
-        ]
-        
-        is_allowed = any(abs_path.startswith(os.path.abspath(allowed_dir)) 
-                        for allowed_dir in allowed_dirs)
-        if not is_allowed:
-            return {'error': f'Access denied: File must be in outputs or uploads directory (base: {base_dir})'}
-        
-    except (ValueError, OSError):
-        return {'error': 'Invalid file path'}
+        abs_path = get_safe_path(file_path)
+    except SecurityError as e:
+        return {'error': str(e)}
     
     if not os.path.exists(abs_path):
         return {'error': 'File not found'}
@@ -402,6 +463,38 @@ def get_file_content(file_path: str, max_size: int = 1024 * 1024) -> dict:
         'content': content,
         'is_binary': ext in binary_extensions
     }
+
+
+def get_document_log(doc_id: int) -> dict:
+    """
+    Get the process.log file for a document.
+    Returns the log content as a list of JSON objects.
+    """
+    doc = get_document(doc_id)
+    if not doc:
+        return {'error': 'Document not found'}
+    
+    log_path = os.path.join(doc['output_path'], 'process.log') if doc['output_path'] else None
+    
+    if not log_path or not os.path.exists(log_path):
+        return {'error': 'Log file not found', 'logs': []}
+    
+    logs = []
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    # Try to parse as JSON, fall back to plain text
+                    try:
+                        import json
+                        logs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logs.append({'time': '', 'level': 'INFO', 'message': line})
+    except Exception as e:
+        return {'error': f'Error reading log file: {str(e)}', 'logs': []}
+    
+    return {'logs': logs}
 
 
 # Initialize database on module import (but not on import in worker threads)

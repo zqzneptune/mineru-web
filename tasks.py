@@ -1,6 +1,7 @@
 import os
 import sys
 import uuid
+import json
 import logging
 import threading
 import multiprocessing
@@ -18,6 +19,10 @@ task_status: Dict[str, dict] = {}
 
 # This prevents multiple background threads from hitting the GPU at the same time
 gpu_processing_lock = threading.Lock()
+
+# Queue tracking for GPU jobs
+waiting_count = 0
+waiting_count_lock = threading.Lock()
 
 
 class LogHandler(logging.Handler):
@@ -74,10 +79,27 @@ def remove_log_queue(task_id: str):
             del log_queues[task_id]
 
 
-def send_log(task_id: str, message: str):
-    """Send a log message to all listeners and queue (thread-safe)"""
+def send_log(task_id: str, message: str, level: str = 'INFO', output_path: Optional[str] = None):
+    """
+    Send a log message to all listeners, queue, and file (thread-safe).
+    
+    Args:
+        task_id: The task identifier
+        message: The log message
+        level: The log level (INFO, WARNING, ERROR, etc.)
+        output_path: Optional output path to write log file
+    """
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_message = f"[{timestamp}] {message}"
+    
+    # Create structured log entry
+    log_entry = {
+        'time': timestamp,
+        'level': level,
+        'message': message
+    }
+    
+    # Format for SSE streaming (legacy format for compatibility)
+    stream_message = f"[{timestamp}] {message}"
     
     # Send to registered callbacks
     with _log_lock:
@@ -86,16 +108,43 @@ def send_log(task_id: str, message: str):
     
     for callback in listeners:
         try:
-            callback(log_message)
+            callback(stream_message)
         except Exception:
             pass
     
     # Put in queue for SSE streaming
     if queue_obj:
         try:
-            queue_obj.put(log_message, block=False)
+            queue_obj.put(stream_message, block=False)
         except queue.Full:
             pass
+    
+    # Write to file if output_path is provided
+    if output_path:
+        log_file = os.path.join(output_path, 'process.log')
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry) + '\n')
+        except Exception:
+            pass
+
+
+def get_queue_position(task_id: str) -> int:
+    """
+    Get the queue position for a task.
+    Returns 0 if the task is actively processing, -1 if not found.
+    """
+    global waiting_count
+    
+    status = task_status.get(task_id, {})
+    
+    # If task is completed or failed, position is 0
+    if status.get('status') in ['completed', 'failed', 'running']:
+        return 0
+    
+    # If task is waiting, return the current waiting count
+    with waiting_count_lock:
+        return waiting_count if waiting_count > 0 else 1
 
 
 def cleanup_gpu_memory():
@@ -171,55 +220,69 @@ def _run_mineru_isolated(output_dir, pdf_path, lang, backend, gpu_memory_utiliza
 
 def process_document(doc_id: int, pdf_path: str, backend: str = 'hybrid-auto-engine', lang: str = 'ch'):
     """Process a document using MinerU with process isolation to prevent GPU memory issues"""
+    global waiting_count
+    
     task_id = f"task_{doc_id}"
     
     # Initialize task status
     task_status[task_id] = {
         'doc_id': doc_id,
-        'status': 'running',
+        'status': 'waiting',
         'start_time': datetime.now(),
         'logs': []
     }
     
-    send_log(task_id, f"Starting document processing (ID: {doc_id})")
-    send_log(task_id, f"Using backend: {backend}, language: {lang}")
+    # Import database functions
+    from database import get_document, update_document_status
     
-    # Set up logging
+    # Get document info from database
+    doc = get_document(doc_id)
+    
+    if not doc:
+        send_log(task_id, f"Error: Document not found in database", 'ERROR')
+        update_document_status(doc_id, 'failed', 'Document not found')
+        return
+    
+    output_dir = doc['output_path']
+    
+    # Set up logging - use file-based logging
     logger = logging.getLogger('mineru')
     log_handler = LogHandler(task_id)
     log_handler.setLevel(logging.INFO)
     logger.addHandler(log_handler)
     
-    # Import database functions outside try block so they're available in the exception handler
-    from database import get_document, update_document_status
+    # Create output directory and initialize log file
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Send initial log messages with file output
+    send_log(task_id, f"Starting document processing (ID: {doc_id})", 'INFO', output_dir)
+    send_log(task_id, f"Using backend: {backend}, language: {lang}", 'INFO', output_dir)
+    send_log(task_id, f"Input file: {pdf_path}", 'INFO', output_dir)
+    send_log(task_id, f"Output directory: {output_dir}", 'INFO', output_dir)
+    
+    # Update status to processing
+    task_status[task_id]['status'] = 'processing'
+    update_document_status(doc_id, 'processing')
+    
+    # Increment waiting count (job is queued)
+    with waiting_count_lock:
+        waiting_count += 1
     
     try:
-        # Get document info from database
-        doc = get_document(doc_id)
-        
-        if not doc:
-            send_log(task_id, f"Error: Document not found in database")
-            update_document_status(doc_id, 'failed', 'Document not found')
-            return
-        
-        output_dir = doc['output_path']
-        
-        send_log(task_id, f"Input file: {pdf_path}")
-        send_log(task_id, f"Output directory: {output_dir}")
-        
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-        
         # --- CHANGE THIS LINE ---
         # 0.75 gives 5.7GB to vLLM and leaves 1.9GB free for the Formula/OCR models
         gpu_memory_utilization = float(os.environ.get('MINERU_VLLM_GPU_MEMORY_UTILIZATION', '0.75'))
-        send_log(task_id, f"GPU memory utilization set to: {gpu_memory_utilization}")
+        send_log(task_id, f"GPU memory utilization set to: {gpu_memory_utilization}", 'INFO', output_dir)
         
         # Wait for GPU availability and acquire lock to prevent concurrent GPU usage
-        send_log(task_id, "Waiting in queue for GPU availability...")
+        send_log(task_id, "Waiting in queue for GPU availability...", 'INFO', output_dir)
+        
+        # Decrement waiting count (about to acquire lock)
+        with waiting_count_lock:
+            waiting_count -= 1
         
         with gpu_processing_lock:
-            send_log(task_id, "GPU acquired. Calling MinerU parser in isolated process...")
+            send_log(task_id, "GPU acquired. Calling MinerU parser in isolated process...", 'INFO', output_dir)
             start_time = datetime.now()
             
             # Run MinerU in an isolated process with 'spawn' context to ensure clean GPU memory
@@ -238,34 +301,40 @@ def process_document(doc_id: int, pdf_path: str, backend: str = 'hybrid-auto-eng
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
             
-            send_log(task_id, f"Processing completed successfully!")
-            send_log(task_id, f"Total time: {duration:.2f} seconds")
+            send_log(task_id, f"Processing completed successfully!", 'INFO', output_dir)
+            send_log(task_id, f"Total time: {duration:.2f} seconds", 'INFO', output_dir)
         
         # Update database status
         update_document_status(doc_id, 'completed')
+        task_status[task_id]['status'] = 'completed'
         
         # List output files
-        send_log(task_id, "Output files:")
+        send_log(task_id, "Output files:", 'INFO', output_dir)
         output_path = Path(output_dir)
         for item in output_path.rglob('*'):
             if item.is_file():
                 size_kb = item.stat().st_size / 1024
-                send_log(task_id, f"  - {item.name} ({size_kb:.1f} KB)")
+                send_log(task_id, f"  - {item.name} ({size_kb:.1f} KB)", 'INFO', output_dir)
         
     except Exception as e:
         import traceback
-        send_log(task_id, f"Error occurred: {str(e)}")
-        send_log(task_id, f"Traceback: {traceback.format_exc()}")
+        send_log(task_id, f"Error occurred: {str(e)}", 'ERROR', output_dir)
+        send_log(task_id, f"Traceback: {traceback.format_exc()}", 'ERROR', output_dir)
         update_document_status(doc_id, 'failed', str(e))
+        task_status[task_id]['status'] = 'failed'
     
     finally:
+        # Decrement waiting count in case of exception before lock acquisition
+        with waiting_count_lock:
+            if waiting_count > 0:
+                waiting_count -= 1
+        
         # Remove log handler
         logger.removeHandler(log_handler)
         log_handler.close()
         
         # Clean up
         if task_id in task_status:
-            task_status[task_id]['status'] = 'completed' if task_status[task_id]['status'] == 'running' else 'failed'
             task_status[task_id]['end_time'] = datetime.now()
         
         # Unregister listeners after a delay to ensure all logs are sent
